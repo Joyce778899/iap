@@ -22,46 +22,51 @@ def read_any(file):
         raise ValueError("仅支持 CSV/XLSX 文件")
 
 # ---------- 智能读取 Apple 财报（自动尝试 0–5 行作为表头） ----------
+# ---------- 针对“最新 financial 文件”格式的读取 ----------
 def read_report(file):
-    df = None
-    currency_col = None
-    for header in range(6):
-        try:
-            file.seek(0)
-            temp = pd.read_csv(file, header=header) if file.name.lower().endswith(".csv") \
-                   else pd.read_excel(file, header=header, engine="openpyxl")
-            temp.columns = [str(c).strip() for c in temp.columns]
-            cand = [c for c in temp.columns if ("国家或地区" in c and "货币" in c) or ("货币" in c)]
-            if cand:
-                df = temp
-                currency_col = cand[0]
-                break
-        except Exception:
-            pass
-    file.seek(0)
-    if df is None:
-        raise ValueError("❌ 无法识别财报表头，请检查文件（未找到包含“货币”的列）")
+    """
+    读取 Apple 财报（最新格式）：
+    - 表头固定在第 3 行：header=2
+    - 用 on_bad_lines='skip' 跳过异常行（该文件确实有一行字段数不一致）
+    - 两个“收入”列中，最后一个“收入.1”为美元收入
+    - 保留关键列并转数值，提取币种代码
+    """
+    # 1) 读取（容错：跳过坏行）
+    df = (pd.read_csv(file, header=2, engine="python", on_bad_lines="skip")
+          if file.name.lower().endswith(".csv")
+          else pd.read_excel(file, header=2, engine="openpyxl"))
 
-    # 收入列自动兜底
-    if "收入.1" not in df.columns:
-        alt = [c for c in df.columns if ("收入" in c and c != "收入")]
-        if alt:
-            df["收入.1"] = df[alt[0]]
-        elif "收入" in df.columns:
-            df["收入.1"] = df["收入"]
-        else:
-            raise ValueError("❌ 财报没有找到 '收入.1' 或等价列（收入/包含“收入”的列）")
+    # 2) 标准化列名与清理
+    df.columns = [str(c).strip() for c in df.columns]
+    # 某些导出会多出一个尾列 Unnamed: xx，这里直接丢掉
+    df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]]
 
-    # 数值列
-    for c in ["总欠款", "收入.1", "调整", "预扣税"]:
+    # 3) 校验关键列
+    need = ["国家或地区 (货币)", "总欠款", "调整", "预扣税"]
+    for c in need:
         if c not in df.columns:
-            df[c] = 0 if c in ["调整", "预扣税"] else None
+            raise ValueError(f"❌ 财报缺少关键列：{c}")
+
+    # 4) 确认美元收入列：收入.1 是美元收入（你这份文件即如此）
+    if "收入.1" not in df.columns:
+        # 极端情况兜底：如果没有，就尝试从右往左第一个“收入”
+        income_like = [c for c in df.columns if c.startswith("收入")]
+        if not income_like:
+            raise ValueError("❌ 未找到美元收入列：收入.1")
+        # 取最后一个“收入”作为美元收入
+        last_income = income_like[-1]
+        df["收入.1"] = df[last_income]
+
+    # 5) 数值化
+    for c in ["总欠款", "收入.1", "调整", "预扣税"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 提取币种
-    df["Currency"] = df[currency_col].astype(str).str.extract(r"\((\w+)\)")
+    # 6) 提取三位币种代码（从 “国家或地区 (货币)”）
+    df["Currency"] = df["国家或地区 (货币)"].astype(str).str.extract(r"\((\w{3})\)")
     df = df.dropna(subset=["Currency"])
-    return df
+
+    # 7) 只返回下游需要的列
+    return df[["Currency", "总欠款", "收入.1", "调整", "预扣税"]]
 
 def build_rates(df_report):
     valid = df_report[(df_report["收入.1"].notna()) & (df_report["收入.1"] != 0)]
