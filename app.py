@@ -1,5 +1,6 @@
-# app.py  — IAP ORCAT Online (Matrix Financial Report Edition)
+# app.py — IAP ORCAT Online（矩阵财报专用，含去重与向量化修复）
 import re
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -8,23 +9,21 @@ st.title("💼 IAP — ORCAT Online（矩阵财报专用）")
 
 with st.expander("使用说明", expanded=False):
     st.markdown("""
-**需要上传 3 个文件：**  
+**请上传 3 个文件：**  
 1) **交易表**（CSV/XLSX）：包含 金额（本币）、币种、SKU  
-2) **Apple 财报（矩阵格式）**（CSV/XLSX）：第一列存在“国家或地区 (货币)”，右侧为各币种列；下方多行是指标（总欠款/收入(美元)或收入.1/调整/预扣税/汇率）  
+2) **Apple 财报（矩阵格式）**（CSV/XLSX）：第一列为“国家或地区 (货币)”，右侧为各币种列；下方多行是指标（总欠款/收入(美元)或收入.1/调整/预扣税/汇率）  
 3) **项目-SKU 映射**（XLSX）：列 `项目`、`SKU`（SKU 可换行多个）
 
-**计算逻辑：**  
-- 从矩阵财报抽取：每个币种的「总欠款、美元收入(收入.1)、调整、预扣税、汇率(本币/美元)」  
-- 若缺“汇率”，则用 **总欠款/收入.1** 推导  
-- 分摊美元：**(调整+预扣税)/汇率**，按交易 USD 占比分摊到每条记录  
-- 结果：逐单（毛收入USD、分摊、净额、项目） + 项目汇总 + 下载
+**计算概览：**  
+- 从矩阵财报抽取每币种：`总欠款`、`收入.1(USD)`、`调整`、`预扣税`、`汇率(本币/美元)`；若缺“汇率”则用 `总欠款/收入.1` 推导  
+- 分摊美元：`(调整+预扣税)/汇率` 的总额按交易 USD 占比分摊到每条记录  
+- 结果输出：逐单（毛收入USD、分摊、净额、项目）与项目汇总，可下载
 """)
 
-# ------------------ 工具函数 ------------------
+# ------------------ 基础读取 ------------------
 def _read_any(uploaded, header=None):
     name = uploaded.name.lower()
     if name.endswith(".csv"):
-        # python 引擎 + on_bad_lines 跳过坏行，适配“期望字段数不一致”的情况
         return pd.read_csv(uploaded, header=header, engine="python", on_bad_lines="skip")
     elif name.endswith((".xlsx", ".xls")):
         return pd.read_excel(uploaded, header=header, engine="openpyxl")
@@ -36,9 +35,9 @@ def _norm_colkey(s: str) -> str:
     s = re.sub(r'[\s\-\_\/\.\(\):，,]+', '', s)
     return s
 
-# ------------------ 解析矩阵格式财报 ------------------
+# ------------------ 矩阵财报解析 ------------------
 def find_header_index(raw: pd.DataFrame) -> int:
-    """在无表头 DataFrame 中定位‘国家或地区 (货币)’这行的行号。"""
+    """定位‘国家或地区 (货币)’这一行的行号（无表头 DataFrame）。"""
     col0 = raw.iloc[:, 0].astype(str).str.replace("\u3000", " ").str.strip()
     idx = col0[col0 == "国家或地区 (货币)"].index.tolist()
     if idx:
@@ -62,28 +61,27 @@ def _normalize_metric_name(s: str) -> str:
 
 def parse_matrix_report(uploaded) -> pd.DataFrame:
     """
-    将“国家或地区 (货币)”横向矩阵格式财报，标准化为长表：
+    将“国家或地区 (货币)”横向矩阵财报标准化为长表：
     返回列：Currency, 总欠款, 收入.1(USD), 汇率(本币/美元), 调整, 预扣税, AdjTaxUSD
     """
     raw = _read_any(uploaded, header=None)
     hdr = find_header_index(raw)
 
-    # 第一行是列标题（第一格为“国家或地区 (货币)”；后续每格为“国家(币种)”）
-    headers = raw.iloc[hdr, :].tolist()
+    headers = raw.iloc[hdr, :].tolist()                  # 第一行：国家(货币) + 各币种列名
     data_block = raw.iloc[hdr + 1 :, :].copy()
     data_block.columns = [f"col{i}" for i in range(data_block.shape[1])]
     metric_names = data_block["col0"].astype(str).str.strip()
 
     wanted = {"总欠款", "收入.1", "收入", "调整", "预扣税", "汇率"}
 
-    # 收集每个币种列
+    # 币种列（跳过第一格标题）
     currencies_headers = []
     for h in headers[1:]:
         hs = str(h).strip()
         if hs and hs.lower() != "nan":
             currencies_headers.append(hs)
 
-    # 逐币种抽取指标值
+    # 逐币种抽取指标
     records = []
     for j, cur in enumerate(currencies_headers, start=1):
         colname = f"col{j}"
@@ -100,34 +98,49 @@ def parse_matrix_report(uploaded) -> pd.DataFrame:
         if (pd.isna(usd_rev) or usd_rev is pd.NA) and ("收入" in values):
             usd_rev = values.get("收入", pd.NA)
 
-        rec = {
+        records.append({
             "CurrencyHeader": cur,
             "总欠款": values.get("总欠款", pd.NA),
-            "收入.1": usd_rev,          # 这里把“收入.1”视为美元收入
+            "收入.1": usd_rev,      # 视为美元收入
             "调整": values.get("调整", 0),
             "预扣税": values.get("预扣税", 0),
-            "汇率": values.get("汇率", pd.NA),  # 若缺失，后面用 总欠款/收入.1 推导
-        }
-        records.append(rec)
+            "汇率": values.get("汇率", pd.NA),  # 若缺则后续用 总欠款/收入.1 推导
+        })
 
     tidy = pd.DataFrame(records)
 
-    # 从 "中国 (CNY)" 这种文本中提取三位币种代码
+    # —— 修复点 1：去重列名，避免重复列名引发“多列赋单列”错误
+    tidy = tidy.loc[:, ~tidy.columns.duplicated(keep="first")]
+
+    # 提取 3 位币种代码
     tidy["Currency"] = tidy["CurrencyHeader"].astype(str).str.extract(r"\(([A-Za-z]{3})\)").iloc[:, 0]
     tidy = tidy.dropna(subset=["Currency"]).reset_index(drop=True)
 
     # 数值化
-    for c in ["总欠款", "收入.1", "调整", "预扣税"]:
-        tidy[c] = pd.to_numeric(tidy[c], errors="coerce").fillna(0.0)
+    for c in ["总欠款", "收入.1", "调整", "预扣税", "汇率"]:
+        if c in tidy.columns:
+            tidy[c] = pd.to_numeric(tidy[c], errors="coerce")
 
-    # 汇率：优先直接取“汇率”，否则用 总欠款/收入.1 推导
-    tidy["rate_calc"] = tidy.apply(lambda r: (r["总欠款"] / r["收入.1"]) if r["收入.1"] not in (0, None, pd.NA) else pd.NA, axis=1)
-    tidy["rate"] = pd.to_numeric(tidy["汇率"], errors="coerce")
-    tidy.loc[tidy["rate"].isna(), "rate"] = tidy.loc[tidy["rate"].isna(), "rate_calc"]
+    # —— 修复点 2：向量化推导汇率，避免 apply 返回 DataFrame
+    income = tidy["收入.1"].fillna(0).to_numpy(dtype="float64")
+    base_local = tidy["总欠款"].fillna(0).to_numpy(dtype="float64")
+    rate_calc = np.where(income != 0, base_local / income, np.nan)
 
-    # 分摊总额折美元： (调整 + 预扣税) / rate
-    tidy["AdjTaxUSD"] = (tidy["调整"].fillna(0) + tidy["预扣税"].fillna(0)) / tidy["rate"]
-    tidy["AdjTaxUSD"] = pd.to_numeric(tidy["AdjTaxUSD"], errors="coerce").fillna(0.0)
+    if "汇率" in tidy.columns:
+        rate_given = tidy["汇率"].to_numpy(dtype="float64")
+    else:
+        rate_given = np.full(len(tidy), np.nan, dtype="float64")
+
+    rate = np.where(np.isnan(rate_given), rate_calc, rate_given)
+    tidy["rate"] = rate
+
+    # —— 修复点 3：分摊美元（避免除 0）
+    adj = tidy["调整"].fillna(0).to_numpy(dtype="float64")
+    wht = tidy["预扣税"].fillna(0).to_numpy(dtype="float64")
+    denom = rate.copy()
+    denom[denom == 0] = np.nan
+    adj_usd = (adj + wht) / denom
+    tidy["AdjTaxUSD"] = pd.to_numeric(adj_usd, errors="coerce")
 
     # 输出列
     out = tidy[["Currency", "总欠款", "收入.1", "rate", "调整", "预扣税", "AdjTaxUSD"]].rename(
