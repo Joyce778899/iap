@@ -1,29 +1,35 @@
-# app.py — IAP ORCAT Online（矩阵财报 | USD/本币 汇率版）
+# app.py — IAP ORCAT Online（矩阵财报 | USD/本币 汇率 | 强校验版）
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="IAP — ORCAT Online (Matrix USD/Local)", page_icon="💼", layout="wide")
-st.title("💼 IAP — ORCAT Online（矩阵财报专用 | USD/本币）")
+st.set_page_config(page_title="IAP — ORCAT Online (Matrix USD/Local, Safe)", page_icon="💼", layout="wide")
+st.title("💼 IAP — ORCAT Online（矩阵财报 | USD/本币 | 强校验版）")
 
 with st.expander("使用说明", expanded=False):
     st.markdown("""
-**请上传 3 个文件：**
-1) 交易表（CSV/XLSX）：包含 金额（本币）、币种（3位代码）、SKU
-2) Apple 财报（CSV/XLSX，矩阵格式）：第3行为表头，包含列：`国家或地区 (货币) / 收入 / ... / 总欠款 / 汇率 / 收入.1 / 银行账户币种`
-3) 项目-SKU 映射（XLSX）：列 `项目`、`SKU`（SKU 可换行多个）
+**上传 3 个文件：**
+1) 交易表（CSV/XLSX）：需含 金额（本币）、币种（建议 3 位代码）、SKU  
+2) Apple 财报（CSV/XLSX，矩阵格式）：**第三行**为表头，包含 `国家或地区 (货币) / 收入 / 总欠款 / 汇率 / 收入.1 / 预扣税 / 调整` 等  
+3) 项目-SKU 映射（XLSX）：列 `项目`、`SKU`，SKU 支持换行多个
 
-**核心逻辑（与你的文件匹配）：**
-- 从 `国家或地区 (货币)` 提取币种（三位代码）
-- 按币种聚合：`汇率(USD/本币) = ∑(收入.1, USD) / ∑(总欠款, 本币)`
-- `(调整 + 预扣税)` 折美元用 **乘法**：`(调整+预扣税) * 汇率(USD/本币)`
-- 交易换算美元：`Extended Partner Share * 汇率(USD/本币)`
-- 成本按交易 USD 占比分摊到每条记录
-- 分摊后**净额合计 == 财报美元收入总额**
+**核心逻辑（与你的模板完全匹配）**
+- 从 `国家或地区 (货币)` 提取币种（三位代码）  
+- 按币种聚合：`汇率(USD/本币) = ∑(收入.1, USD) / ∑(总欠款, 本币)`  
+- `(调整+预扣税)` 折美元：**乘法** `(调整+预扣税) * 汇率(USD/本币)`  
+- 交易 USD：`Extended Partner Share * 汇率(USD/本币)`（USD 自身=1）  
+- 分摊按交易 USD 占比分配到每条记录  
+- 最终校验：**交易净额 USD 合计 ≈ 财报美元收入合计**（可设容差）
+
+**防呆/自检**
+- 强制展开“手动列映射”  
+- 金额单位选择：元/分(÷100)/厘(÷1000)  
+- 金额分布体检（p90/p99/max），异常直接阻断  
+- 币种值标准化（中文币名/括号代码 → 3 位代码），对不上直接阻断
 """)
 
-# ---------- 基础读取 ----------
+# ---------------- 基础读取 ----------------
 def _read_any(uploaded, header=None):
     name = uploaded.name.lower()
     if name.endswith(".csv"):
@@ -38,21 +44,20 @@ def _norm_colkey(s: str) -> str:
     s = re.sub(r'[\s\-\_\/\.\(\):，,]+', '', s)
     return s
 
-# ---------- 财报解析（矩阵 → 币种聚合，USD/本币） ----------
+# ---------------- 财报解析（矩阵 → 币种聚合；USD/本币） ----------------
 def read_report_matrix(uploaded) -> pd.DataFrame:
-    # 你的文件为 header=2（第三行）
+    # 你的财报为第三行(索引=2)是表头
     df = _read_any(uploaded, header=2)
-    # 丢掉 Unnamed
+    # 去掉自动生成的 Unnamed
     df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]]
     df.columns = [str(c).strip() for c in df.columns]
-
     if "国家或地区 (货币)" not in df.columns:
         raise ValueError("财报缺少列：国家或地区 (货币)")
 
-    # 提取三位币种
+    # 提取三位币种代码
     df["Currency"] = df["国家或地区 (货币)"].astype(str).str.extract(r"\(([A-Za-z]{3})\)").iloc[:, 0]
 
-    # 数值化（可能缺列，逐个兜底）
+    # 数值化（若列缺失则补 NaN）
     for c in ["收入", "收入.1", "调整", "预扣税", "总欠款", "汇率"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -61,21 +66,22 @@ def read_report_matrix(uploaded) -> pd.DataFrame:
 
     # 币种聚合
     grp = df.dropna(subset=["Currency"]).groupby("Currency", dropna=False).agg(
-        local_sum=("总欠款", "sum"),
-        usd_sum=("收入.1", "sum"),
-        adj_sum=("调整", "sum"),
-        wht_sum=("预扣税", "sum"),
+        local_sum=("总欠款","sum"),
+        usd_sum=("收入.1","sum"),
+        adj_sum=("调整","sum"),
+        wht_sum=("预扣税","sum"),
     ).reset_index()
 
-    # 汇率(USD/本币)
+    # 汇率(USD/本币)：∑USD / ∑本币
     grp["rate_usd_per_local"] = np.where(
-        grp["local_sum"].abs() > 0, grp["usd_sum"].abs() / grp["local_sum"].abs(), np.nan
+        grp["local_sum"].abs() > 0,
+        grp["usd_sum"].abs() / grp["local_sum"].abs(),
+        np.nan
     )
 
     # (调整+预扣税) 折美元（乘法）
     grp["AdjTaxUSD"] = (grp["adj_sum"].fillna(0) + grp["wht_sum"].fillna(0)) * grp["rate_usd_per_local"]
 
-    # 输出审计表
     audit = grp.rename(columns={
         "local_sum": "本币总欠款",
         "usd_sum": "美元收入合计(收入.1)",
@@ -91,12 +97,12 @@ def build_rates_and_totals(audit_df: pd.DataFrame):
     total_adj_usd = float(pd.to_numeric(audit_df["AdjTaxUSD"], errors="coerce").sum())
     return rates, total_adj_usd, report_total_usd
 
-# ---------- 交易表（自动识别 + 手动映射） ----------
+# ---------------- 交易表：自动识别 + 强制人工确认 + 自检 ----------------
 def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
     cols = list(df.columns)
     norm_map = {c: _norm_colkey(c) for c in cols}
 
-    # 金额候选（列名）
+    # 金额列：关键词优先，否则选“可解析数值最多且总额最大”的列
     amount = None
     for c, n in norm_map.items():
         if ('extended' in n and 'partner' in n and ('share' in n or 'proceeds' in n or 'amount' in n)) \
@@ -105,7 +111,6 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
            or (('proceeds' in n or 'revenue' in n or 'amount' in n) and ('partner' in n or 'publisher' in n)):
             amount = c; break
     if amount is None:
-        # 数值最多&总额最大的列
         scores = {}
         for c in cols:
             s = df[c].astype(str).str.replace(",", "", regex=False)
@@ -114,7 +119,7 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
             scores[c] = (v.notna().sum(), v.abs().sum(skipna=True))
         amount = max(scores, key=lambda c: (scores[c][0], scores[c][1]))
 
-    # 币种候选：值是 3位大写代码 + 列名关键词加分
+    # 币种列：列值中 3 位代码占比 + 列名关键词加分
     def ccy_score(series: pd.Series) -> float:
         s = series.dropna().astype(str).str.strip()
         token = s.str.extract(r"([A-Z]{3})")[0]
@@ -123,12 +128,8 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
         return rate + bonus
     c_scores = {c: ccy_score(df[c]) for c in cols}
     currency = max(c_scores, key=c_scores.get)
-    if c_scores.get(currency, 0) < 0.4:
-        for c, n in norm_map.items():
-            if ('currency' in n) or (n.endswith('currencycode')) or (n.endswith('currency')):
-                currency = c; break
 
-    # SKU 候选
+    # SKU 列
     sku = None
     for c, n in norm_map.items():
         if n == 'sku' or n.endswith('sku') or 'productid' in n or n == 'productid' or n == 'itemid':
@@ -136,7 +137,6 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
     if sku is None and 'SKU' in cols:
         sku = 'SKU'
     if sku is None:
-        # 非数值列且去重较多
         text_scores = {}
         for c in cols:
             s = df[c].astype(str)
@@ -149,7 +149,17 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
 
     return amount, currency, sku
 
-def read_tx(uploaded):
+# 中文币名 → 3 位代码（可按需扩充）
+_CNY_MAP = {
+    "人民币": "CNY","美元": "USD","欧元": "EUR","日元": "JPY","英镑": "GBP","港币": "HKD",
+    "新台币": "TWD","台币":"TWD","韩元": "KRW","澳元": "AUD","加元":"CAD","新西兰元":"NZD",
+    "卢布":"RUB","里拉":"TRY","兰特":"ZAR","瑞郎":"CHF","新加坡元":"SGD","沙特里亚尔":"SAR",
+    "阿联酋迪拉姆":"AED","泰铢":"THB","新谢克尔":"ILS","匈牙利福林":"HUF","捷克克朗":"CZK",
+    "丹麦克朗":"DKK","挪威克朗":"NOK","瑞典克朗":"SEK","波兰兹罗提":"PLN","罗马尼亚列伊":"RON",
+    "墨西哥比索":"MXN","巴西雷亚尔":"BRL","智利比索":"CLP","新台幣":"TWD"
+}
+
+def read_tx(uploaded, report_rates: dict):
     df = _read_any(uploaded)
     df.columns = [str(c).strip() for c in df.columns]
     st.subheader("📊 交易表预览")
@@ -158,68 +168,105 @@ def read_tx(uploaded):
 
     a, c, s = _auto_guess_tx_cols_by_values(df)
     cols = list(df.columns)
-    with st.expander("🛠 手动列映射（可修改）", expanded=True):
+    with st.expander("🛠 手动列映射（请确认/修正）", expanded=True):
         a = st.selectbox("金额列（Extended Partner Share / Proceeds / Amount）", cols, index=(cols.index(a) if a in cols else 0))
-        c = st.selectbox("币种列（3位代码，如 USD/CNY）", cols, index=(cols.index(c) if c in cols else 0))
+        c = st.selectbox("币种列（3位代码或中文币名）", cols, index=(cols.index(c) if c in cols else 0))
         s = st.selectbox("SKU 列（SKU / Product ID / Item ID）", cols, index=(cols.index(s) if s in cols else 0))
+        unit = st.radio("金额单位", ["单位元（不用换）", "单位分（÷100）", "单位厘（÷1000）"], index=0, horizontal=True)
 
-    df = df.rename(columns={a: "Extended Partner Share", c: "Partner Share Currency", s: "SKU"})
+    df = df.rename(columns={a:"Extended Partner Share", c:"Partner Share Currency", s:"SKU"})
 
-    need = {"Extended Partner Share", "Partner Share Currency", "SKU"}
+    need = {"Extended Partner Share","Partner Share Currency","SKU"}
     missing = need - set(df.columns)
     if missing:
         st.error(f"系统猜测：金额={a} 币种={c} SKU={s}")
         raise ValueError(f"❌ 交易表缺列：{missing}")
 
-    # 金额清洗 & 币种标准化
-    s = df["Extended Partner Share"].astype(str).str.replace(",", "", regex=False)
-    s = s.str.replace(r"[^\d\.\-\+]", "", regex=True)
-    df["Extended Partner Share"] = pd.to_numeric(s, errors="coerce")
-    df["Partner Share Currency"] = df["Partner Share Currency"].astype(str).str.strip().str.upper()
+    # 金额清洗 + 单位换算
+    s_amt = df["Extended Partner Share"].astype(str).str.replace(",", "", regex=False)
+    s_amt = s_amt.str.replace(r"[^\d\.\-\+]", "", regex=True)
+    amt = pd.to_numeric(s_amt, errors="coerce")
+    if unit == "单位分（÷100）":
+        amt = amt / 100.0
+    elif unit == "单位厘（÷1000）":
+        amt = amt / 1000.0
+    df["Extended Partner Share"] = amt
+
+    # 币种标准化（中文名/括号内代码 → 3位代码 → 大写）
+    cval = df["Partner Share Currency"].astype(str).str.strip()
+    code_from_paren = cval.str.extract(r"\(([A-Za-z]{3})\)", expand=False)
+    final_ccy = cval.str.upper()
+    final_ccy = np.where(code_from_paren.notna(), code_from_paren.str.upper(), final_ccy)
+    final_ccy = pd.Series(final_ccy).replace(_CNY_MAP).str.upper()
+    df["Partner Share Currency"] = final_ccy
+
+    # —— 自检 1：金额分布（大额阻断）
+    desc = amt.describe(percentiles=[0.5,0.9,0.99])
+    p99, vmax = float(desc.get("99%", np.nan)), float(desc.get("max", np.nan))
+    st.info(f"金额统计：min={desc.get('min',np.nan):.2f}, median={desc.get('50%',np.nan):.2f}, "
+            f"p90={desc.get('90%',np.nan):.2f}, p99={p99:.2f}, max={vmax:.2f}")
+    big_idx = np.argsort(-amt.fillna(0).to_numpy())[:20]
+    st.caption("Top 20 大额样本（用于自检）")
+    st.dataframe(df.iloc[big_idx][["Extended Partner Share","Partner Share Currency","SKU"]])
+    if p99 > 1e6 or vmax > 1e8:
+        st.error("⚠️ 金额分布异常大：可能金额列选错或金额单位不是“元”。请检查映射与“金额单位”。")
+        st.stop()
+
+    # —— 自检 2：币种集合对齐（缺失阻断）
+    tx_ccy = set(df["Partner Share Currency"].dropna().unique().tolist())
+    report_ccy = set(k for k,v in report_rates.items() if np.isfinite(v))
+    st.write("交易表币种个数：", len(tx_ccy), "；财报币种个数：", len(report_ccy))
+    st.write("交集样例：", sorted(list(tx_ccy & report_ccy))[:20])
+    missing_in_report = sorted(tx_ccy - report_ccy)
+    if missing_in_report:
+        st.error(f"⚠️ 以下币种在财报中不存在或无法计算汇率：{missing_in_report}。请修正交易表币种或财报。")
+        st.stop()
 
     return df
 
-# ---------- 映射表 ----------
+# ---------------- 映射表 ----------------
 def read_map(uploaded):
     mp = _read_any(uploaded, header=0)
     mp.columns = [str(c).strip() for c in mp.columns]
     st.subheader("📊 映射表预览")
     st.write("列名：", list(mp.columns))
     st.dataframe(mp.head())
-    if not {"项目", "SKU"}.issubset(mp.columns):
-        raise ValueError("❌ 映射表缺少列：项目 或 SKU")
+    if not {"项目","SKU"}.issubset(mp.columns):
+        raise ValueError("❌ 映射表缺列：项目 或 SKU")
     mp = mp.assign(SKU=mp["SKU"].astype(str).str.split("\n")).explode("SKU")
     mp["SKU"] = mp["SKU"].str.strip()
     mp = mp[mp["SKU"] != ""]
-    return mp[["项目", "SKU"]]
+    return mp[["项目","SKU"]]
 
-# ---------- 上传 ----------
+# ---------------- 页面上传 ----------------
 c1, c2, c3 = st.columns(3)
-with c1: tx = st.file_uploader("① 交易表（CSV/XLSX）", type=["csv", "xlsx", "xls"], key="tx")
-with c2: rp = st.file_uploader("② Apple 财报（矩阵，CSV/XLSX）", type=["csv", "xlsx", "xls"], key="rp")
-with c3: mp = st.file_uploader("③ 项目-SKU（XLSX）", type=["xlsx", "xls"], key="mp")
+with c1: tx = st.file_uploader("① 交易表（CSV/XLSX）", type=["csv","xlsx","xls"], key="tx")
+with c2: rp = st.file_uploader("② Apple 财报（矩阵，CSV/XLSX）", type=["csv","xlsx","xls"], key="rp")
+with c3: mp = st.file_uploader("③ 项目-SKU（XLSX）", type=["xlsx","xls"], key="mp")
 
-if st.button("🚀 开始计算（USD/本币）"):
+strict_check = st.checkbox("严格校验：净额总和≈财报美元收入（容差 $0.5 USD）", value=True)
+
+if st.button("🚀 开始计算（USD/本币 | 强校验）"):
     if not (tx and rp and mp):
         st.error("❌ 请先上传三份文件")
     else:
         try:
-            # 1) 财报 → 币种审计（USD/本币）
+            # 1) 财报 → 审计表（USD/本币）
             audit = read_report_matrix(rp)
             rates, total_adj_usd, report_total_usd = build_rates_and_totals(audit)
 
-            # 2) 交易 + 映射
-            txdf = read_tx(tx)
+            # 2) 交易 + 自检
+            txdf = read_tx(tx, rates)
             mpdf = read_map(mp)
             sku2proj = dict(zip(mpdf["SKU"], mpdf["项目"]))
 
-            # 3) 交易换算 USD（乘以 USD/本币）
+            # 3) 交易换算美元（乘以 USD/本币）
             txdf["rate_usd_per_local"] = txdf["Partner Share Currency"].map(rates)
             txdf["Extended Partner Share USD"] = txdf["Extended Partner Share"] * txdf["rate_usd_per_local"]
 
             tx_total_usd = float(pd.to_numeric(txdf["Extended Partner Share USD"], errors="coerce").sum())
             if not np.isfinite(tx_total_usd) or tx_total_usd == 0:
-                st.error("❌ 交易 USD 合计为 0：请检查币种列是否为 3位代码且与财报币种一致")
+                st.error("❌ 交易 USD 合计为 0：检查金额列/金额单位/币种映射")
                 st.stop()
 
             # 4) 成本分摊（按交易 USD 占比）
@@ -227,11 +274,20 @@ if st.button("🚀 开始计算（USD/本币）"):
             txdf["Net Partner Share (USD)"] = txdf["Extended Partner Share USD"] + txdf["Cost Allocation (USD)"]
             txdf["项目"] = txdf["SKU"].astype(str).map(sku2proj)
 
-            # 5) 项目汇总 & 校验
+            # 5) 项目汇总
             summary = txdf.groupby("项目", dropna=False)[
                 ["Extended Partner Share USD", "Cost Allocation (USD)", "Net Partner Share (USD)"]
             ].sum().reset_index()
 
+            # 6) 校验：净额 ≈ 财报美元收入
+            net_total = float(pd.to_numeric(txdf["Net Partner Share (USD)"], errors="coerce").sum())
+            diff = net_total - report_total_usd
+            if strict_check and not np.isfinite(diff) or (strict_check and abs(diff) > 0.5):
+                st.error(f"❌ 对账失败：交易净额 {net_total:,.2f} USD 与财报 {report_total_usd:,.2f} USD 差异 {diff:,.2f}。"
+                         "请检查金额列/金额单位/币种。")
+                st.stop()
+
+            # 7) 总行与下载
             total_row = {
                 "项目": "__TOTAL__",
                 "Extended Partner Share USD": float(summary["Extended Partner Share USD"].sum()),
@@ -240,12 +296,11 @@ if st.button("🚀 开始计算（USD/本币）"):
             }
             summary = pd.concat([summary, pd.DataFrame([total_row])], ignore_index=True)
 
-            # 6) 展示 & 下载
-            st.success("✅ 计算完成（净额已对齐财报美元收入）")
+            st.success("✅ 计算完成")
             st.markdown(f"- 财报美元收入合计（∑收入.1）：**{report_total_usd:,.2f} USD**")
             st.markdown(f"- 分摊总额（调整+预扣税 → USD）：**{total_adj_usd:,.2f} USD**")
             st.markdown(f"- 交易毛收入 USD 合计：**{tx_total_usd:,.2f} USD**")
-            st.markdown(f"- 交易净额 USD 合计：**{float(txdf['Net Partner Share (USD)'].sum()):,.2f} USD**")
+            st.markdown(f"- 交易净额 USD 合计：**{net_total:,.2f} USD**，差异：**{diff:,.2f} USD**")
 
             st.download_button("⬇️ 审计：每币种汇率与分摊 (CSV)",
                                data=audit.to_csv(index=False).encode("utf-8-sig"),
