@@ -1,31 +1,30 @@
-# app.py — IAP ORCAT Online（矩阵财报 | USD/本币 汇率 | 强校验版）
+# app.py — IAP ORCAT Online（矩阵财报 | USD/本币 | 强校验 + 防串列）
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="IAP — ORCAT Online (Matrix USD/Local, Safe)", page_icon="💼", layout="wide")
-st.title("💼 IAP — ORCAT Online（矩阵财报 | USD/本币 | 强校验版）")
+st.title("💼 IAP — ORCAT Online（矩阵财报 | USD/本币 | 强校验）")
 
 with st.expander("使用说明", expanded=False):
     st.markdown("""
 **上传 3 个文件：**
 1) 交易表（CSV/XLSX）：需含 金额（本币）、币种（建议 3 位代码）、SKU  
 2) Apple 财报（CSV/XLSX，矩阵格式）：**第三行**为表头，包含 `国家或地区 (货币) / 收入 / 总欠款 / 汇率 / 收入.1 / 预扣税 / 调整` 等  
-3) 项目-SKU 映射（XLSX）：列 `项目`、`SKU`，SKU 支持换行多个
+3) 项目-SKU 映射（XLSX）：列 `项目`、`SKU`（SKU 可换行多个）
 
-**核心逻辑（与你的模板完全匹配）**
-- 从 `国家或地区 (货币)` 提取币种（三位代码）  
-- 按币种聚合：`汇率(USD/本币) = ∑(收入.1, USD) / ∑(总欠款, 本币)`  
-- `(调整+预扣税)` 折美元：**乘法** `(调整+预扣税) * 汇率(USD/本币)`  
-- 交易 USD：`Extended Partner Share * 汇率(USD/本币)`（USD 自身=1）  
-- 分摊按交易 USD 占比分配到每条记录  
-- 最终校验：**交易净额 USD 合计 ≈ 财报美元收入合计**（可设容差）
+**核心逻辑（与你的模板匹配）**
+- 从 `国家或地区 (货币)` 提取币种（三位代码）
+- 币种聚合：`汇率(USD/本币) = ∑(收入.1, USD) / ∑(总欠款, 本币)`
+- `(调整+预扣税)` 折美元：**乘法** `(调整+预扣税) * 汇率(USD/本币)`
+- 交易 USD：`Extended Partner Share * 汇率(USD/本币)`（USD 自身=1）
+- 分摊按交易 USD 占比；最终**净额合计 ≈ 财报美元收入合计**（可设容差）
 
 **防呆/自检**
-- 强制展开“手动列映射”  
-- 金额单位选择：元/分(÷100)/厘(÷1000)  
-- 金额分布体检（p90/p99/max），异常直接阻断  
+- 强制展开“手动列映射”
+- 金额单位选择：元/分(÷100)/厘(÷1000)
+- 金额分布体检（p90/p99/max；疑似ID列自动排除），异常直接阻断
 - 币种值标准化（中文币名/括号代码 → 3 位代码），对不上直接阻断
 """)
 
@@ -48,7 +47,6 @@ def _norm_colkey(s: str) -> str:
 def read_report_matrix(uploaded) -> pd.DataFrame:
     # 你的财报为第三行(索引=2)是表头
     df = _read_any(uploaded, header=2)
-    # 去掉自动生成的 Unnamed
     df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]]
     df.columns = [str(c).strip() for c in df.columns]
     if "国家或地区 (货币)" not in df.columns:
@@ -98,11 +96,26 @@ def build_rates_and_totals(audit_df: pd.DataFrame):
     return rates, total_adj_usd, report_total_usd
 
 # ---------------- 交易表：自动识别 + 强制人工确认 + 自检 ----------------
+# 中文币名 → 3 位代码（可按需扩充）
+_CNY_MAP = {
+    "人民币": "CNY","美元": "USD","欧元": "EUR","日元": "JPY","英镑": "GBP","港币": "HKD",
+    "新台币": "TWD","台币":"TWD","韩元": "KRW","澳元": "AUD","加元":"CAD","新西兰元":"NZD",
+    "卢布":"RUB","里拉":"TRY","兰特":"ZAR","瑞郎":"CHF","新加坡元":"SGD","沙特里亚尔":"SAR",
+    "阿联酋迪拉姆":"AED","泰铢":"THB","新谢克尔":"ILS","匈牙利福林":"HUF","捷克克朗":"CZK",
+    "丹麦克朗":"DKK","挪威克朗":"NOK","瑞典克朗":"SEK","波兰兹罗提":"PLN","罗马尼亚列伊":"RON",
+    "墨西哥比索":"MXN","巴西雷亚尔":"BRL","智利比索":"CLP","新台幣":"TWD"
+}
+
+def _parse_numeric(s: pd.Series) -> pd.Series:
+    t = s.astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-\+]", "", regex=True)
+    return pd.to_numeric(t, errors="coerce")
+
 def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
     cols = list(df.columns)
     norm_map = {c: _norm_colkey(c) for c in cols}
 
-    # 金额列：关键词优先，否则选“可解析数值最多且总额最大”的列
+    # ===== 1) 金额列（防串列：自动排除“像ID”的长整型列） =====
+    # 先按关键词命中
     amount = None
     for c, n in norm_map.items():
         if ('extended' in n and 'partner' in n and ('share' in n or 'proceeds' in n or 'amount' in n)) \
@@ -110,16 +123,41 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
            or (('partnershare' in n or 'partnerproceeds' in n) and ('amount' in n or 'gross' in n or 'net' in n)) \
            or (('proceeds' in n or 'revenue' in n or 'amount' in n) and ('partner' in n or 'publisher' in n)):
             amount = c; break
-    if amount is None:
-        scores = {}
-        for c in cols:
-            s = df[c].astype(str).str.replace(",", "", regex=False)
-            s = s.str.replace(r"[^\d\.\-\+]", "", regex=True)
-            v = pd.to_numeric(s, errors="coerce")
-            scores[c] = (v.notna().sum(), v.abs().sum(skipna=True))
-        amount = max(scores, key=lambda c: (scores[c][0], scores[c][1]))
 
-    # 币种列：列值中 3 位代码占比 + 列名关键词加分
+    # 兜底：分布评分 + 排除“疑似ID”
+    candidates = []
+    for c in cols:
+        v = _parse_numeric(df[c])
+        if v.notna().mean() < 0.3:
+            continue
+        # 疑似ID：大多是整数 & p99 >= 1e9（10位级）
+        ints_ratio = (v.dropna() == np.floor(v.dropna())).mean() if v.notna().any() else 0
+        p99 = v.quantile(0.99) if v.notna().any() else 0
+        if ints_ratio > 0.95 and p99 >= 1e9:
+            continue  # 排除ID样式列
+
+        # 评分：非空数、多样性、中位量级（过大降权）
+        score = (
+            v.notna().sum(),
+            float(np.nanmedian(np.abs(v))) if v.notna().any() else 0.0,
+            -float(np.nanquantile(np.abs(v), 0.99)) if v.notna().any() else 0.0
+        )
+        candidates.append((score, c))
+    if amount is None:
+        if candidates:
+            candidates.sort(reverse=True)
+            amount = candidates[0][1]
+        else:
+            # 万不得已：回退到“非空多&总和大”
+            best = None; best_score = (-1, -1)
+            for c in cols:
+                v = _parse_numeric(df[c])
+                score = (v.notna().sum(), v.abs().sum(skipna=True))
+                if score > best_score:
+                    best, best_score = c, score
+            amount = best
+
+    # ===== 2) 币种列 =====
     def ccy_score(series: pd.Series) -> float:
         s = series.dropna().astype(str).str.strip()
         token = s.str.extract(r"([A-Z]{3})")[0]
@@ -129,7 +167,7 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
     c_scores = {c: ccy_score(df[c]) for c in cols}
     currency = max(c_scores, key=c_scores.get)
 
-    # SKU 列
+    # ===== 3) SKU 列 =====
     sku = None
     for c, n in norm_map.items():
         if n == 'sku' or n.endswith('sku') or 'productid' in n or n == 'productid' or n == 'itemid':
@@ -140,24 +178,13 @@ def _auto_guess_tx_cols_by_values(df: pd.DataFrame):
         text_scores = {}
         for c in cols:
             s = df[c].astype(str)
-            v = pd.to_numeric(s.str.replace(",", "", regex=False).str.replace(r"[^\d\.\-\+]", "", regex=True),
-                              errors="coerce")
+            v = _parse_numeric(s)
             nonnum_ratio = v.isna().mean()
             nunique = s.nunique(dropna=True)
             text_scores[c] = (nonnum_ratio, nunique)
         sku = max(text_scores, key=lambda c: (text_scores[c][0], text_scores[c][1]))
 
     return amount, currency, sku
-
-# 中文币名 → 3 位代码（可按需扩充）
-_CNY_MAP = {
-    "人民币": "CNY","美元": "USD","欧元": "EUR","日元": "JPY","英镑": "GBP","港币": "HKD",
-    "新台币": "TWD","台币":"TWD","韩元": "KRW","澳元": "AUD","加元":"CAD","新西兰元":"NZD",
-    "卢布":"RUB","里拉":"TRY","兰特":"ZAR","瑞郎":"CHF","新加坡元":"SGD","沙特里亚尔":"SAR",
-    "阿联酋迪拉姆":"AED","泰铢":"THB","新谢克尔":"ILS","匈牙利福林":"HUF","捷克克朗":"CZK",
-    "丹麦克朗":"DKK","挪威克朗":"NOK","瑞典克朗":"SEK","波兰兹罗提":"PLN","罗马尼亚列伊":"RON",
-    "墨西哥比索":"MXN","巴西雷亚尔":"BRL","智利比索":"CLP","新台幣":"TWD"
-}
 
 def read_tx(uploaded, report_rates: dict):
     df = _read_any(uploaded)
@@ -183,9 +210,7 @@ def read_tx(uploaded, report_rates: dict):
         raise ValueError(f"❌ 交易表缺列：{missing}")
 
     # 金额清洗 + 单位换算
-    s_amt = df["Extended Partner Share"].astype(str).str.replace(",", "", regex=False)
-    s_amt = s_amt.str.replace(r"[^\d\.\-\+]", "", regex=True)
-    amt = pd.to_numeric(s_amt, errors="coerce")
+    amt = _parse_numeric(df["Extended Partner Share"])
     if unit == "单位分（÷100）":
         amt = amt / 100.0
     elif unit == "单位厘（÷1000）":
@@ -215,7 +240,7 @@ def read_tx(uploaded, report_rates: dict):
     # —— 自检 2：币种集合对齐（缺失阻断）
     tx_ccy = set(df["Partner Share Currency"].dropna().unique().tolist())
     report_ccy = set(k for k,v in report_rates.items() if np.isfinite(v))
-    st.write("交易表币种个数：", len(tx_ccy), "；财报币种个数：", len(report_ccy))
+    st.write("交易表币种个数：", len(tx_ccy), "；财报可用币种个数：", len(report_ccy))
     st.write("交集样例：", sorted(list(tx_ccy & report_ccy))[:20])
     missing_in_report = sorted(tx_ccy - report_ccy)
     if missing_in_report:
@@ -282,7 +307,7 @@ if st.button("🚀 开始计算（USD/本币 | 强校验）"):
             # 6) 校验：净额 ≈ 财报美元收入
             net_total = float(pd.to_numeric(txdf["Net Partner Share (USD)"], errors="coerce").sum())
             diff = net_total - report_total_usd
-            if strict_check and not np.isfinite(diff) or (strict_check and abs(diff) > 0.5):
+            if strict_check and (not np.isfinite(diff) or abs(diff) > 0.5):
                 st.error(f"❌ 对账失败：交易净额 {net_total:,.2f} USD 与财报 {report_total_usd:,.2f} USD 差异 {diff:,.2f}。"
                          "请检查金额列/金额单位/币种。")
                 st.stop()
