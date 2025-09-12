@@ -1,11 +1,11 @@
-# app.py — IAP ORCAT Online（严格模式｜财报表头=第3行｜使用“汇率”列｜健壮币种解析）
+# app.py — IAP ORCAT Online（严格模式｜财报表头=第3行｜使用“汇率”列｜稳健币种解析）
 
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="IAP — ORCAT Online (Final)", page_icon="💼", layout="wide")
+st.set_page_config(page_title="IAP — ORCAT Online (Final+Fix)", page_icon="💼", layout="wide")
 st.title("💼 IAP — ORCAT Online（严格｜财报表头=第3行｜使用财报汇率）")
 
 with st.expander("使用说明", expanded=False):
@@ -38,29 +38,31 @@ def _num(s: pd.Series) -> pd.Series:
 REQ_REPORT = ["国家或地区 (货币)", "总欠款", "收入.1", "汇率"]
 OPT_REPORT = ["调整", "预扣税"]
 
-# ✅ 更健壮的币种解析：全角/半角括号、无空格、任意位置 3 位大写代码；必要时回退到其它列
+# 稳健币种解析：全/半角括号、无空格、任意位置3位大写代码；必要时回退到其它列
 _CCY_FALLBACK_COLS = ["银行账户币种", "币种", "货币", "Currency", "Account Currency"]
 
 def _extract_currency_series(series: pd.Series, df: pd.DataFrame) -> pd.Series:
     s = series.astype(str)
 
-    # 1) 先从括号提取：支持半角() 和全角（）
+    # 1) 括号中的3位代码：支持半角()和全角（）
     pat_paren = re.compile(r"[（(]\s*([A-Za-z]{3})\s*[）)]")
     c1 = s.str.extract(pat_paren, expand=False)
 
-    # 2) 若仍为空，找文本中任意 3 位大写字母块
+    # 2) 任意位置 3 位大写代码
     c2 = s.where(c1.notna(), s).str.extract(r"\b([A-Z]{3})\b", expand=False)
 
-    cur = c1.fillna(c2).str.upper()
+    # 3) 合并 + upper（注意转字符串，避免 .str 报错）
+    cur = c1.fillna(c2).astype(str).str.upper()
+    cur = cur.replace("NAN", np.nan)
 
-    # 3) 回退：如果仍有很多 NaN，尝试其它常见列
+    # 4) 回退列
     if cur.isna().mean() > 0.2:
         for col in _CCY_FALLBACK_COLS:
             if col in df.columns:
                 alt = df[col].astype(str).str.extract(r"\b([A-Za-z]{3})\b", expand=False).str.upper()
                 cur = cur.fillna(alt)
 
-    # 4) 仍然大量 NaN，则抛错并给出样例原文
+    # 5) 最终检查
     if cur.isna().mean() > 0.2:
         bad = s[cur.isna()].head(6).tolist()
         raise ValueError(f"无法提取币种，示例问题行：{bad}")
@@ -83,7 +85,7 @@ def read_report_final(uploaded):
         else:
             df[c] = np.nan
 
-    # ✅ 使用健壮解析获取 Currency
+    # 稳健解析 Currency
     df["Currency"] = _extract_currency_series(df["国家或地区 (货币)"], df)
 
     grp = df.groupby("Currency", dropna=False).agg(
