@@ -5,19 +5,23 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="IAP — ORCAT Online (Final+Fix)", page_icon="💼", layout="wide")
+st.set_page_config(page_title="IAP — ORCAT Online (Final+Strict)", page_icon="💼", layout="wide")
 st.title("💼 IAP — ORCAT Online（严格｜财报表头=第3行｜使用财报汇率）")
 
 with st.expander("使用说明", expanded=False):
     st.markdown("""
 **① 财报（CSV/XLSX，表头=第3行）**  
 - `国家或地区 (货币)`：如 `阿拉伯联合酋长国 (AED)` / `阿联酋（AED）` / `阿联酋(AED)`  
-- `总欠款`（本币），`收入.1`（USD），`调整`（本币，可空），`预扣税`（本币，可空），`汇率`（USD/本币）
+- `总欠款`（本币），`收入.1`（USD），`调整`（本币，可空），`预扣税`（本币，可空），`汇率`（USD/本币，脚本直接使用）
 
 **② 交易表（CSV/XLSX）**：`Extended Partner Share`、`Partner Share Currency`、`SKU`  
-**③ 映射表（XLSX）**：`项目`、`SKU`（SKU 可换行多值）
 
-**规则**：用财报`汇率`；(调整+预扣税)×汇率→USD后按交易USD占比分摊；对账容差 0.5 USD
+**③ 映射表（XLSX）**：`项目`、`SKU`（SKU 支持换行多个）
+
+**规则**  
+- 用财报 `汇率`（USD/本币；同一币种多行用**中位数**）  
+- `(调整+预扣税)`（本币）×`汇率`→USD 后按交易 USD 占比分摊  
+- 交易本币 ×`汇率`→USD；`∑净额 ≈ ∑财报(收入.1)`（容差 0.5 USD）
 """)
 
 # ---------- 工具 ----------
@@ -38,28 +42,32 @@ def _num(s: pd.Series) -> pd.Series:
 REQ_REPORT = ["国家或地区 (货币)", "总欠款", "收入.1", "汇率"]
 OPT_REPORT = ["调整", "预扣税"]
 
-# 稳健币种解析：全/半角括号、无空格、任意位置3位大写代码；必要时回退到其它列
-_CCY_FALLBACK_COLS = ["银行账户币种", "币种", "货币", "Currency", "Account Currency"]
+# 稳健币种解析：优先仅用“国家或地区 (货币)”；谨慎回退（排除整列=USD 这类单值列）
+_CCY_FALLBACK_COLS = ["币种", "货币", "Currency"]  # 不包含“银行账户币种”等容易整列为 USD 的列
 
 def _extract_currency_series(series: pd.Series, df: pd.DataFrame) -> pd.Series:
     s = series.astype(str)
 
-    # 1) 括号中的3位代码：支持半角()和全角（）
+    # 1) 括号中的 3 位代码（支持半角() / 全角（ ））
     pat_paren = re.compile(r"[（(]\s*([A-Za-z]{3})\s*[）)]")
     c1 = s.str.extract(pat_paren, expand=False)
 
-    # 2) 任意位置 3 位大写代码
+    # 2) 任意位置出现的 3 位大写代码
     c2 = s.where(c1.notna(), s).str.extract(r"\b([A-Z]{3})\b", expand=False)
 
-    # 3) 合并 + upper（注意转字符串，避免 .str 报错）
+    # 3) 合并 + upper（先转字符串避免 .str 报错）
     cur = c1.fillna(c2).astype(str).str.upper()
     cur = cur.replace("NAN", np.nan)
 
-    # 4) 回退列
+    # 4) 若缺失比例仍高，再谨慎回退：仅当回退列不是单一常量（如全是 USD）时才用
     if cur.isna().mean() > 0.2:
         for col in _CCY_FALLBACK_COLS:
             if col in df.columns:
-                alt = df[col].astype(str).str.extract(r"\b([A-Za-z]{3})\b", expand=False).str.upper()
+                alt_raw = df[col].astype(str)
+                alt = alt_raw.str.extract(r"\b([A-Za-z]{3})\b", expand=False).str.upper()
+                uniq = alt.dropna().unique()
+                if len(uniq) <= 1:  # 单值列（例如全 USD）不采用，避免覆盖真实币种
+                    continue
                 cur = cur.fillna(alt)
 
     # 5) 最终检查
@@ -85,7 +93,7 @@ def read_report_final(uploaded):
         else:
             df[c] = np.nan
 
-    # 稳健解析 Currency
+    # 稳健解析 Currency（避免被账户币种覆盖）
     df["Currency"] = _extract_currency_series(df["国家或地区 (货币)"], df)
 
     grp = df.groupby("Currency", dropna=False).agg(
@@ -113,9 +121,12 @@ def read_report_final(uploaded):
     report_total_usd = float(audit["美元收入合计(收入.1)"].sum())
     total_adj_usd = float(audit["AdjTaxUSD"].sum())
 
-    inconsistent = audit.loc[audit["rate_min"].round(8) != audit["rate_max"].round(8), ["Currency","rate_min","rate_max","rows"]]
+    inconsistent = audit.loc[
+        audit["rate_min"].round(8) != audit["rate_max"].round(8),
+        ["Currency","rate_min","rate_max","rows"]
+    ]
     if len(inconsistent):
-        st.warning("以下币种的财报`汇率`存在差异，已使用**中位数**：")
+        st.warning("以下币种的财报`汇率`存在差异，**已使用中位数**：")
         st.dataframe(inconsistent)
 
     return audit, rates, total_adj_usd, report_total_usd
@@ -216,15 +227,24 @@ if st.button("🚀 开始计算"):
         st.markdown(f"- 交易毛收入 USD 合计：**{tx_total_usd:,.2f} USD**")
         st.markdown(f"- 交易净额 USD 合计：**{net_total:,.2f} USD**（差异 {diff:,.2f} USD）")
 
-        st.download_button("⬇️ 审计表 (CSV)",
+        st.download_button(
+            "⬇️ 审计表 (CSV)",
             data=audit.to_csv(index=False).encode("utf-8-sig"),
-            file_name="financial_report_audit.csv", mime="text/csv")
-        st.download_button("⬇️ 逐单结果 (CSV)",
+            file_name="financial_report_audit.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "⬇️ 逐单结果 (CSV)",
             data=tx.to_csv(index=False).encode("utf-8-sig"),
-            file_name="transactions_usd.csv", mime="text/csv")
-        st.download_button("⬇️ 项目汇总 (CSV)",
+            file_name="transactions_usd.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "⬇️ 项目汇总 (CSV)",
             data=summary.to_csv(index=False).encode("utf-8-sig"),
-            file_name="project_summary.csv", mime="text/csv")
+            file_name="project_summary.csv",
+            mime="text/csv",
+        )
 
         with st.expander("预览：财报审计", expanded=False):
             st.dataframe(audit)
