@@ -11,27 +11,26 @@ st.title("💼 IAP — ORCAT Online（严格｜财报表头=第3行｜使用财�
 with st.expander("使用说明", expanded=False):
     st.markdown("""
 **① 财报（CSV/XLSX，表头=第3行）**  
-- `国家或地区 (货币)`：例如 `阿拉伯联合酋长国 (AED)`（括号内必须是3位币种代码）  
+- `国家或地区 (货币)`：如 `阿拉伯联合酋长国 (AED)`（括号内为 3 位代码）  
 - `总欠款`（本币）  
-- `收入.1`（美元收入，即总欠款折算成USD）  
+- `收入.1`（美元收入＝总欠款折 USD）  
 - `调整`（本币，可空）  
 - `预扣税`（本币，可空）  
-- `汇率`（**USD/本币**；本脚本直接使用该列）
+- `汇率`（**USD/本币**；直接使用该列）
 
 **② 交易表（CSV/XLSX）**  
 - `Extended Partner Share`（本币金额）  
 - `Partner Share Currency`（3位币种代码）  
 - `SKU`
 
-**③ 项目–SKU 映射表（XLSX）**  
-- `项目`  
-- `SKU`（可一格多值，换行分隔）
+**③ 项目–SKU 映射（XLSX）**  
+- `项目`，`SKU`（SKU 支持换行多个）
 
-**核心逻辑**  
-- 财报：用 `汇率` 列直接作为每币种的换算比率（USD/本币）  
-- `(调整+预扣税)`：按本币汇总后 × 汇率 → USD，再分摊到交易  
-- 交易：本币金额 × 汇率 → USD，按占比分摊成本  
-- 对账：∑净额 ≈ ∑财报美元收入（容差 0.5 USD）
+**规则**  
+- 财报按币种取 `汇率` 中位数为 **USD/本币**  
+- `(调整+预扣税)`（本币）×汇率 → USD 后分摊到交易  
+- 交易本币 ×汇率 → USD；按占比摊成本  
+- 对账：∑净额 ≈ ∑财报 USD（容差 0.5）
 """)
 
 # ---------- 工具 ----------
@@ -144,9 +143,12 @@ def read_map_final(uploaded):
 
 # ---------- UI ----------
 c1, c2, c3 = st.columns(3)
-with c1: tx_file = st.file_uploader("① 交易表（CSV/XLSX）", type=["csv","xlsx","xls"])
-with c2: rp_file = st.file_uploader("② 财报（CSV/XLSX｜表头=第3行）", type=["csv","xlsx","xls"])
-with c3: mp_file = st.file_uploader("③ 项目–SKU（XLSX）", type=["xlsx","xls"])
+with c1:
+    tx_file = st.file_uploader("① 交易表（CSV/XLSX）", type=["csv","xlsx","xls"])
+with c2:
+    rp_file = st.file_uploader("② 财报（CSV/XLSX｜表头=第3行）", type=["csv","xlsx","xls"])
+with c3:
+    mp_file = st.file_uploader("③ 项目–SKU（XLSX）", type=["xlsx","xls"])
 
 amount_unit = st.radio("交易金额单位", ["元(不用换)", "分(÷100)", "厘(÷1000)"], index=0, horizontal=True)
 strict_check = st.checkbox("严格对账：|∑净额 − ∑财报USD| ≤ 0.5", value=True)
@@ -154,11 +156,13 @@ strict_check = st.checkbox("严格对账：|∑净额 − ∑财报USD| ≤ 0.5"
 if st.button("🚀 开始计算"):
     try:
         # 1) 财报
-        if not rp_file: raise ValueError("未上传财报")
+        if not rp_file:
+            raise ValueError("未上传财报")
         audit, rates, total_adj_usd, report_total_usd = read_report_final(rp_file)
 
         # 2) 交易
-        if not tx_file: raise ValueError("未上传交易表")
+        if not tx_file:
+            raise ValueError("未上传交易表")
         tx = read_tx_final(tx_file, amount_unit)
 
         tx_ccy = set(tx["Partner Share Currency"].dropna().unique())
@@ -176,8 +180,9 @@ if st.button("🚀 开始计算"):
         tx["Cost Allocation (USD)"] = tx["Extended Partner Share USD"] / tx_total_usd * total_adj_usd
         tx["Net Partner Share (USD)"] = tx["Extended Partner Share USD"] + tx["Cost Allocation (USD)"]
 
-        # 3) 映射
-        if not mp_file: raise ValueError("未上传项目–SKU 映射")
+        # 3) 映射与汇总
+        if not mp_file:
+            raise ValueError("未上传项目–SKU 映射")
         mp = read_map_final(mp_file)
         sku2proj = dict(zip(mp["SKU"], mp["项目"]))
         tx["项目"] = tx["SKU"].astype(str).map(sku2proj)
@@ -198,15 +203,25 @@ if st.button("🚀 开始计算"):
         st.markdown(f"- 交易毛收入 USD 合计：**{tx_total_usd:,.2f} USD**")
         st.markdown(f"- 交易净额 USD 合计：**{net_total:,.2f} USD**（差异 {diff:,.2f} USD）")
 
-        st.download_button("⬇️ 审计表 (CSV)", data=audit.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="financial_report_audit.csv", mime="text/csv")
-        st.download_button("⬇️ 逐单结果 (CSV)", data=tx.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="transactions_usd.csv", mime="text/csv")
-        st.download_button("⬇️ 项目汇总 (CSV)", data=summary.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="project_summary.csv", mime="text/csv")
+        st.download_button("⬇️ 审计表 (CSV)",
+            data=audit.to_csv(index=False).encode("utf-8-sig"),
+            file_name="financial_report_audit.csv", mime="text/csv")
+        st.download_button("⬇️ 逐单结果 (CSV)",
+            data=tx.to_csv(index=False).encode("utf-8-sig"),
+            file_name="transactions_usd.csv", mime="text/csv")
+        st.download_button("⬇️ 项目汇总 (CSV)",
+            data=summary.to_csv(index=False).encode("utf-8-sig"),
+            file_name="project_summary.csv", mime="text/csv")
 
         with st.expander("预览：财报审计", expanded=False):
             st.dataframe(audit)
+
         with st.expander("预览：逐单结果", expanded=False):
             st.dataframe(tx.head(200))
+
         with st.expander("预览：项目汇总", expanded=True):
+            st.dataframe(summary)
+
+    except Exception as e:
+        st.error(f"⚠️ 出错：{e}")
+        st.exception(e)
