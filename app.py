@@ -1,4 +1,4 @@
-# app.py — IAP ORCAT Online（严格模式｜财报表头=第3行｜使用“汇率”列）
+# app.py — IAP ORCAT Online（严格模式｜财报表头=第3行｜使用“汇率”列｜健壮币种解析）
 
 import re
 import numpy as np
@@ -11,26 +11,13 @@ st.title("💼 IAP — ORCAT Online（严格｜财报表头=第3行｜使用财�
 with st.expander("使用说明", expanded=False):
     st.markdown("""
 **① 财报（CSV/XLSX，表头=第3行）**  
-- `国家或地区 (货币)`：如 `阿拉伯联合酋长国 (AED)`（括号内为 3 位代码）  
-- `总欠款`（本币）  
-- `收入.1`（美元收入＝总欠款折 USD）  
-- `调整`（本币，可空）  
-- `预扣税`（本币，可空）  
-- `汇率`（**USD/本币**；直接使用该列）
+- `国家或地区 (货币)`：如 `阿拉伯联合酋长国 (AED)` / `阿联酋（AED）` / `阿联酋(AED)`  
+- `总欠款`（本币），`收入.1`（USD），`调整`（本币，可空），`预扣税`（本币，可空），`汇率`（USD/本币）
 
-**② 交易表（CSV/XLSX）**  
-- `Extended Partner Share`（本币金额）  
-- `Partner Share Currency`（3位币种代码）  
-- `SKU`
+**② 交易表（CSV/XLSX）**：`Extended Partner Share`、`Partner Share Currency`、`SKU`  
+**③ 映射表（XLSX）**：`项目`、`SKU`（SKU 可换行多值）
 
-**③ 项目–SKU 映射（XLSX）**  
-- `项目`，`SKU`（SKU 支持换行多个）
-
-**规则**  
-- 财报按币种取 `汇率` 中位数为 **USD/本币**  
-- `(调整+预扣税)`（本币）×汇率 → USD 后分摊到交易  
-- 交易本币 ×汇率 → USD；按占比摊成本  
-- 对账：∑净额 ≈ ∑财报 USD（容差 0.5）
+**规则**：用财报`汇率`；(调整+预扣税)×汇率→USD后按交易USD占比分摊；对账容差 0.5 USD
 """)
 
 # ---------- 工具 ----------
@@ -51,6 +38,35 @@ def _num(s: pd.Series) -> pd.Series:
 REQ_REPORT = ["国家或地区 (货币)", "总欠款", "收入.1", "汇率"]
 OPT_REPORT = ["调整", "预扣税"]
 
+# ✅ 更健壮的币种解析：全角/半角括号、无空格、任意位置 3 位大写代码；必要时回退到其它列
+_CCY_FALLBACK_COLS = ["银行账户币种", "币种", "货币", "Currency", "Account Currency"]
+
+def _extract_currency_series(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    s = series.astype(str)
+
+    # 1) 先从括号提取：支持半角() 和全角（）
+    pat_paren = re.compile(r"[（(]\s*([A-Za-z]{3})\s*[）)]")
+    c1 = s.str.extract(pat_paren, expand=False)
+
+    # 2) 若仍为空，找文本中任意 3 位大写字母块
+    c2 = s.where(c1.notna(), s).str.extract(r"\b([A-Z]{3})\b", expand=False)
+
+    cur = c1.fillna(c2).str.upper()
+
+    # 3) 回退：如果仍有很多 NaN，尝试其它常见列
+    if cur.isna().mean() > 0.2:
+        for col in _CCY_FALLBACK_COLS:
+            if col in df.columns:
+                alt = df[col].astype(str).str.extract(r"\b([A-Za-z]{3})\b", expand=False).str.upper()
+                cur = cur.fillna(alt)
+
+    # 4) 仍然大量 NaN，则抛错并给出样例原文
+    if cur.isna().mean() > 0.2:
+        bad = s[cur.isna()].head(6).tolist()
+        raise ValueError(f"无法提取币种，示例问题行：{bad}")
+
+    return cur
+
 def read_report_final(uploaded):
     # header=2 → 第3行表头
     df = _read_any(uploaded, header=2)
@@ -67,13 +83,8 @@ def read_report_final(uploaded):
         else:
             df[c] = np.nan
 
-    # 拆分国家和币种
-    m = df["国家或地区 (货币)"].astype(str).str.extract(r"^\s*(.+?)\s*\(([A-Za-z]{3})\)\s*$")
-    df["Country"] = m[0]
-    df["Currency"] = m[1]
-    if df["Currency"].isna().any():
-        bad = df.loc[df["Currency"].isna(), "国家或地区 (货币)"].head(5).tolist()
-        raise ValueError(f"无法提取币种，示例问题行：{bad}")
+    # ✅ 使用健壮解析获取 Currency
+    df["Currency"] = _extract_currency_series(df["国家或地区 (货币)"], df)
 
     grp = df.groupby("Currency", dropna=False).agg(
         local_sum=("总欠款", "sum"),
@@ -97,8 +108,8 @@ def read_report_final(uploaded):
     })
 
     rates = dict(zip(audit["Currency"], audit["汇率(USD/本币)"]))
-    report_total_usd = audit["美元收入合计(收入.1)"].sum()
-    total_adj_usd = audit["AdjTaxUSD"].sum()
+    report_total_usd = float(audit["美元收入合计(收入.1)"].sum())
+    total_adj_usd = float(audit["AdjTaxUSD"].sum())
 
     inconsistent = audit.loc[audit["rate_min"].round(8) != audit["rate_max"].round(8), ["Currency","rate_min","rate_max","rows"]]
     if len(inconsistent):
@@ -173,7 +184,7 @@ if st.button("🚀 开始计算"):
         tx["rate_usd_per_local"] = tx["Partner Share Currency"].map(rates).astype(float)
         tx["Extended Partner Share USD"] = tx["Extended Partner Share"] * tx["rate_usd_per_local"]
 
-        tx_total_usd = tx["Extended Partner Share USD"].sum()
+        tx_total_usd = float(tx["Extended Partner Share USD"].sum())
         if not np.isfinite(tx_total_usd) or tx_total_usd == 0:
             raise ValueError("交易 USD 合计为 0，请检查。")
 
@@ -191,7 +202,7 @@ if st.button("🚀 开始计算"):
             ["Extended Partner Share USD","Cost Allocation (USD)","Net Partner Share (USD)"]
         ].sum().reset_index()
 
-        net_total = tx["Net Partner Share (USD)"].sum()
+        net_total = float(tx["Net Partner Share (USD)"].sum())
         diff = net_total - report_total_usd
         if strict_check and abs(diff) > 0.5:
             raise ValueError(f"对账失败：交易净额 {net_total:,.2f} USD 与财报 {report_total_usd:,.2f} USD 差异 {diff:,.2f} USD")
@@ -215,10 +226,8 @@ if st.button("🚀 开始计算"):
 
         with st.expander("预览：财报审计", expanded=False):
             st.dataframe(audit)
-
         with st.expander("预览：逐单结果", expanded=False):
             st.dataframe(tx.head(200))
-
         with st.expander("预览：项目汇总", expanded=True):
             st.dataframe(summary)
 
