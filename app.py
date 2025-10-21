@@ -199,7 +199,7 @@ def read_fd_txt(fd_file) -> pd.DataFrame:
             raise ValueError(f"FD 缺少列：{c}")
     tx = tx[need].copy()
     tx["Extended Partner Share"] = numify(tx["Extended Partner Share"])
-    tx["Partner Share Currency"] = tx["Partner Share Currency"].astype(str).strip().str.upper()
+    tx["Partner Share Currency"] = tx["Partner Share Currency"].astype(str).str.strip().str.upper()
     return tx
 
 def read_mapping_xlsx(map_file) -> pd.DataFrame:
