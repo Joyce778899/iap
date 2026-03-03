@@ -1,3 +1,5 @@
+streamlit>=1.36.0
 pandas
 openpyxl
-streamlit
+requests
+altair>=5
